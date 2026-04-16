@@ -63,7 +63,13 @@ class ResolvedFile:
 
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
-
+@app.get("/healthz")
+async def healthz():
+    return {
+        "ok": True,
+        "service": APP_NAME,
+        "version": APP_VERSION
+    }
 
 @app.get("/healthz", response_model=HealthResponse)
 async def healthz() -> HealthResponse:
