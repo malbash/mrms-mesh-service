@@ -63,13 +63,22 @@ class ResolvedFile:
 
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION)
-@app.get("/healthz")
-async def healthz():
+
+
+@app.get("/")
+async def root():
     return {
         "ok": True,
         "service": APP_NAME,
-        "version": APP_VERSION
+        "version": APP_VERSION,
+        "message": "MRMS MESH service is running",
+        "routes": [
+            "/healthz",
+            "/docs",
+            "/mesh?lat=33.80&lon=-84.31&date=2025-06-26",
+        ],
     }
+
 
 @app.get("/healthz", response_model=HealthResponse)
 async def healthz() -> HealthResponse:
@@ -177,7 +186,7 @@ async def download_and_cache_grib(client: httpx.AsyncClient, url: str) -> Path:
     grib_path = CACHE_DIR / f"{digest}.grib2"
 
     if grib_path.exists() and grib_path.stat().st_size > 0:
-      return grib_path
+        return grib_path
 
     response = await client.get(url)
     response.raise_for_status()
