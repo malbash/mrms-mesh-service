@@ -4,10 +4,12 @@ import gzip
 import hashlib
 import os
 import re
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import date as date_cls
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 import httpx
 import numpy as np
@@ -16,30 +18,33 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
 APP_NAME = "mrms-mesh-service"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
-DEFAULT_BASE_URLS = [
-    "https://mrms.ncep.noaa.gov/2D/MESH_Max_1440min/",
-    "https://mrms.ncep.noaa.gov/data/2D/MESH_Max_1440min/",
-]
-
-BASE_URLS = [
-    url.strip() if url.strip().endswith("/") else f"{url.strip()}/"
-    for url in os.getenv("MRMS_BASE_URLS", ",".join(DEFAULT_BASE_URLS)).split(",")
-    if url.strip()
-]
-
+AWS_BUCKET_BASE = os.getenv("MRMS_AWS_BASE", "https://noaa-mrms-pds.s3.amazonaws.com")
 CACHE_DIR = Path(os.getenv("CACHE_DIR", "/tmp/mrms-cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "45"))
 DOWNLOAD_TIMEOUT_SECONDS = float(os.getenv("DOWNLOAD_TIMEOUT_SECONDS", "120"))
 
-FILE_RE = re.compile(
-    r"MRMS_MESH_Max_1440min_00\.50_(?P<ymd>\d{8})-(?P<hms>\d{6})\.grib2\.gz"
-)
+# Support the documented current naming, plus a fallback without underscores
+FILENAME_PATTERNS = [
+    re.compile(
+        r"MRMS_MESH_Max_1440min_00\.50_(?P<ymd>\d{8})-(?P<hms>\d{6})\.grib2\.gz$"
+    ),
+    re.compile(
+        r"MRMS_MESHMax1440min_00\.50_(?P<ymd>\d{8})-(?P<hms>\d{6})\.grib2\.gz$"
+    ),
+]
+
+# Prefix candidates to search in AWS
+PREFIX_PATTERNS = [
+    "CONUS/MESH_Max_1440min/{ymd}/",
+    "CONUS/MESHMax1440min/{ymd}/",
+]
 
 MM_PER_INCH = 25.4
+AWS_ARCHIVE_START = date_cls(2020, 10, 1)
 
 
 class MeshResponse(BaseModel):
@@ -47,6 +52,8 @@ class MeshResponse(BaseModel):
     source: str = Field(..., description="Upstream source name")
     timestamp: str = Field(..., description="Resolved MRMS file timestamp in UTC")
     note: str = Field(..., description="Description of returned value")
+    file: str = Field(..., description="Resolved MRMS filename")
+    url: str = Field(..., description="Resolved MRMS source URL")
 
 
 class HealthResponse(BaseModel):
@@ -57,6 +64,7 @@ class HealthResponse(BaseModel):
 
 @dataclass
 class ResolvedFile:
+    key: str
     url: str
     filename: str
     timestamp: datetime
@@ -93,6 +101,12 @@ async def get_mesh(
 ) -> MeshResponse:
     requested_date = parse_iso_date(date)
 
+    if requested_date < AWS_ARCHIVE_START:
+        raise HTTPException(
+            status_code=422,
+            detail="This service currently supports MRMS AWS archive dates from 2020-10-01 onward.",
+        )
+
     async with httpx.AsyncClient(
         follow_redirects=True,
         timeout=httpx.Timeout(
@@ -114,6 +128,8 @@ async def get_mesh(
         source="NOAA MRMS MESH",
         timestamp=resolved.timestamp.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
         note="Maximum Estimated Size of Hail 1440-minute swath at nearest MRMS grid point",
+        file=resolved.filename,
+        url=resolved.url,
     )
 
 
@@ -137,48 +153,87 @@ def normalize_lon_grid(lons: np.ndarray) -> np.ndarray:
 
 
 def parse_filename_timestamp(filename: str) -> datetime:
-    match = FILE_RE.search(filename)
-    if not match:
-        raise HTTPException(status_code=500, detail=f"Unrecognized MRMS filename: {filename}")
+    for pattern in FILENAME_PATTERNS:
+        match = pattern.search(filename)
+        if match:
+            dt = datetime.strptime(
+                f"{match.group('ymd')}{match.group('hms')}",
+                "%Y%m%d%H%M%S",
+            )
+            return dt.replace(tzinfo=timezone.utc)
 
-    dt = datetime.strptime(
-        f"{match.group('ymd')}{match.group('hms')}",
-        "%Y%m%d%H%M%S",
-    )
-    return dt.replace(tzinfo=timezone.utc)
+    raise HTTPException(status_code=500, detail=f"Unrecognized MRMS filename: {filename}")
+
+
+def matches_mesh_filename(filename: str, ymd: str) -> bool:
+    for pattern in FILENAME_PATTERNS:
+        match = pattern.search(filename)
+        if match and match.group("ymd") == ymd:
+            return True
+    return False
 
 
 async def resolve_daily_mesh_file(client: httpx.AsyncClient, requested_date: date_cls) -> ResolvedFile:
     ymd = requested_date.strftime("%Y%m%d")
+    candidates: list[ResolvedFile] = []
 
-    for base_url in BASE_URLS:
-        try:
-            response = await client.get(base_url)
-            response.raise_for_status()
-            filenames = extract_matching_filenames(response.text, ymd)
-            if filenames:
-                filename = sorted(filenames)[-1]
-                return ResolvedFile(
-                    url=f"{base_url}{filename}",
-                    filename=filename,
-                    timestamp=parse_filename_timestamp(filename),
+    for prefix_template in PREFIX_PATTERNS:
+        prefix = prefix_template.format(ymd=ymd)
+        keys = await list_s3_keys(client, prefix)
+
+        for key in keys:
+            filename = key.rsplit("/", 1)[-1]
+            if matches_mesh_filename(filename, ymd):
+                candidates.append(
+                    ResolvedFile(
+                        key=key,
+                        url=f"{AWS_BUCKET_BASE}/{quote(key)}",
+                        filename=filename,
+                        timestamp=parse_filename_timestamp(filename),
+                    )
                 )
-        except httpx.HTTPError:
-            continue
 
-    raise HTTPException(
-        status_code=404,
-        detail=f"No MRMS MESH_Max_1440min file found for {requested_date.isoformat()}",
-    )
+    if not candidates:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No MRMS MESH 1440-minute files found in AWS archive for {requested_date.isoformat()}",
+        )
+
+    candidates.sort(key=lambda item: item.timestamp)
+    return candidates[-1]
 
 
-def extract_matching_filenames(html: str, ymd: str) -> list[str]:
-    matches = []
-    for match in FILE_RE.finditer(html):
-        filename = match.group(0)
-        if match.group("ymd") == ymd:
-            matches.append(filename)
-    return list(dict.fromkeys(matches))
+async def list_s3_keys(client: httpx.AsyncClient, prefix: str) -> list[str]:
+    keys: list[str] = []
+    continuation_token: str | None = None
+
+    while True:
+        params = {
+            "list-type": "2",
+            "prefix": prefix,
+            "max-keys": "1000",
+        }
+        if continuation_token:
+            params["continuation-token"] = continuation_token
+
+        response = await client.get(AWS_BUCKET_BASE + "/", params=params)
+        response.raise_for_status()
+
+        root = ET.fromstring(response.text)
+
+        for elem in root.findall(".//{*}Contents/{*}Key"):
+            if elem.text:
+                keys.append(elem.text)
+
+        is_truncated = root.findtext(".//{*}IsTruncated", default="false").lower() == "true"
+        if not is_truncated:
+            break
+
+        continuation_token = root.findtext(".//{*}NextContinuationToken")
+        if not continuation_token:
+            break
+
+    return keys
 
 
 async def download_and_cache_grib(client: httpx.AsyncClient, url: str) -> Path:
