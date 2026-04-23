@@ -18,7 +18,7 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
 APP_NAME = "mrms-mesh-service"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 
 AWS_BUCKET_BASE = os.getenv("MRMS_AWS_BASE", "https://noaa-mrms-pds.s3.amazonaws.com")
 CACHE_DIR = Path(os.getenv("CACHE_DIR", "/tmp/mrms-cache"))
@@ -34,6 +34,9 @@ FILENAME_PATTERNS = [
 
 MM_PER_INCH = 25.4
 AWS_ARCHIVE_START = date_cls(2020, 10, 1)
+
+# Cache discovered product prefixes in memory so we do not re-list the bucket every request
+MESH_PREFIX_CACHE: list[str] | None = None
 
 
 class MeshResponse(BaseModel):
@@ -141,6 +144,10 @@ def normalize_lon_grid(lons: np.ndarray) -> np.ndarray:
     return np.where(lons > 180.0, lons - 360.0, lons)
 
 
+def to_360_lon(lon: float) -> float:
+    return lon if lon >= 0 else lon + 360.0
+
+
 def parse_filename_timestamp(filename: str) -> datetime:
     for pattern in FILENAME_PATTERNS:
         match = pattern.search(filename)
@@ -207,12 +214,22 @@ async def resolve_daily_mesh_file(client: httpx.AsyncClient, requested_date: dat
 
 
 async def discover_mesh_product_prefixes(client: httpx.AsyncClient) -> list[str]:
+    global MESH_PREFIX_CACHE
+
+    if MESH_PREFIX_CACHE is not None:
+        return MESH_PREFIX_CACHE
+
     prefixes = await list_s3_common_prefixes(client, "CONUS/")
-    mesh_prefixes = [
-        prefix for prefix in prefixes
-        if "MESH" in prefix.upper()
-    ]
-    return sorted(mesh_prefixes)
+
+    # Keep only product folders relevant to daily MESH swath products
+    filtered = []
+    for prefix in prefixes:
+        upper = prefix.upper()
+        if "MESH" in upper and "1440" in upper:
+            filtered.append(prefix)
+
+    MESH_PREFIX_CACHE = sorted(filtered)
+    return MESH_PREFIX_CACHE
 
 
 async def list_s3_common_prefixes(client: httpx.AsyncClient, prefix: str) -> list[str]:
@@ -309,7 +326,13 @@ async def download_and_cache_grib(client: httpx.AsyncClient, url: str) -> Path:
 
 
 def extract_mesh_mm_at_point(grib_path: Path, lat: float, lon: float) -> float:
+    """
+    Memory-safe extraction:
+    Instead of loading the full CONUS grid with grb.values + grb.latlons(),
+    read only a small bounding box around the requested point.
+    """
     norm_lon = normalize_lon_scalar(lon)
+    lon_360 = to_360_lon(norm_lon)
 
     try:
         grbs = pygrib.open(str(grib_path))
@@ -318,19 +341,35 @@ def extract_mesh_mm_at_point(grib_path: Path, lat: float, lon: float) -> float:
 
     try:
         grb = grbs.message(1)
-        values = np.ma.filled(grb.values, np.nan).astype(float)
-        lats, lons = grb.latlons()
-        lons = normalize_lon_grid(lons)
 
-        lat_scale = np.cos(np.deg2rad(lat))
-        dist2 = (lats - lat) ** 2 + ((lons - norm_lon) * lat_scale) ** 2
-        flat_order = np.argsort(dist2, axis=None)
+        # Try progressively larger local boxes around the target point.
+        for pad in (0.25, 0.50, 1.0, 2.0):
+            lat1 = max(-90.0, lat - pad)
+            lat2 = min(90.0, lat + pad)
 
-        for flat_idx in flat_order[:500]:
-            i, j = np.unravel_index(flat_idx, values.shape)
-            value = values[i, j]
-            if np.isfinite(value):
-                return float(value)
+            for center_lon in (lon_360, norm_lon):
+                lon1 = center_lon - pad
+                lon2 = center_lon + pad
+
+                try:
+                    values, lats, lons = grb.data(lat1=lat1, lat2=lat2, lon1=lon1, lon2=lon2)
+                except Exception:
+                    continue
+
+                arr = np.ma.filled(values, np.nan).astype(float)
+                if arr.size == 0 or not np.isfinite(arr).any():
+                    continue
+
+                lats_arr = np.asarray(lats, dtype=float)
+                lons_arr = normalize_lon_grid(np.asarray(lons, dtype=float))
+
+                lat_scale = np.cos(np.deg2rad(lat))
+                dist2 = (lats_arr - lat) ** 2 + ((lons_arr - norm_lon) * lat_scale) ** 2
+                dist2 = np.where(np.isfinite(arr), dist2, np.inf)
+
+                idx = np.argmin(dist2)
+                if np.isfinite(dist2.flat[idx]):
+                    return float(arr.flat[idx])
 
         raise HTTPException(status_code=404, detail="No finite MESH value found near requested point")
     finally:
