@@ -18,7 +18,7 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
 APP_NAME = "mrms-mesh-service"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 
 AWS_BUCKET_BASE = os.getenv("MRMS_AWS_BASE", "https://noaa-mrms-pds.s3.amazonaws.com")
 CACHE_DIR = Path(os.getenv("CACHE_DIR", "/tmp/mrms-cache"))
@@ -27,6 +27,7 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "45"))
 DOWNLOAD_TIMEOUT_SECONDS = float(os.getenv("DOWNLOAD_TIMEOUT_SECONDS", "120"))
 
+# Supported filename patterns for the daily 1440-minute MESH swath product
 FILENAME_PATTERNS = [
     re.compile(r"MRMS_MESH_Max_1440min_00\.50_(?P<ymd>\d{8})-(?P<hms>\d{6})\.grib2\.gz$"),
     re.compile(r"MRMS_MESHMax1440min_00\.50_(?P<ymd>\d{8})-(?P<hms>\d{6})\.grib2\.gz$"),
@@ -35,7 +36,7 @@ FILENAME_PATTERNS = [
 MM_PER_INCH = 25.4
 AWS_ARCHIVE_START = date_cls(2020, 10, 1)
 
-# Cache discovered product prefixes in memory so we do not re-list the bucket every request
+# Cache discovered prefixes in memory so we do not relist the bucket every request
 MESH_PREFIX_CACHE: list[str] | None = None
 
 
@@ -197,8 +198,7 @@ async def resolve_daily_mesh_file(client: httpx.AsyncClient, requested_date: dat
                     )
                 )
 
-    deduped = {item.key: item for item in candidates}
-    candidates = list(deduped.values())
+    candidates = list({item.key: item for item in candidates}.values())
 
     if not candidates:
         raise HTTPException(
@@ -220,9 +220,8 @@ async def discover_mesh_product_prefixes(client: httpx.AsyncClient) -> list[str]
         return MESH_PREFIX_CACHE
 
     prefixes = await list_s3_common_prefixes(client, "CONUS/")
-
-    # Keep only product folders relevant to daily MESH swath products
     filtered = []
+
     for prefix in prefixes:
         upper = prefix.upper()
         if "MESH" in upper and "1440" in upper:
@@ -300,36 +299,61 @@ async def list_s3_keys(client: httpx.AsyncClient, prefix: str) -> list[str]:
 
 
 async def download_and_cache_grib(client: httpx.AsyncClient, url: str) -> Path:
+    """
+    Memory-safe download:
+    - stream the .gz file to disk
+    - stream gunzip to disk
+    - avoid holding the full compressed + decompressed payload in RAM
+    """
     digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
     grib_path = CACHE_DIR / f"{digest}.grib2"
 
     if grib_path.exists() and grib_path.stat().st_size > 0:
         return grib_path
 
-    response = await client.get(url)
-    response.raise_for_status()
-    payload = response.content
+    gz_tmp_path = CACHE_DIR / f"{digest}.download.gz"
+    raw_tmp_path = CACHE_DIR / f"{digest}.download.tmp"
+
+    if gz_tmp_path.exists():
+        gz_tmp_path.unlink()
+    if raw_tmp_path.exists():
+        raw_tmp_path.unlink()
+
+    async with client.stream("GET", url) as response:
+        response.raise_for_status()
+
+        if url.endswith(".gz"):
+            with open(gz_tmp_path, "wb") as f:
+                async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
+                    f.write(chunk)
+        else:
+            with open(raw_tmp_path, "wb") as f:
+                async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
+                    f.write(chunk)
 
     if url.endswith(".gz"):
         try:
-            raw_bytes = gzip.decompress(payload)
+            with gzip.open(gz_tmp_path, "rb") as src, open(raw_tmp_path, "wb") as dst:
+                while True:
+                    chunk = src.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
         except OSError as exc:
             raise HTTPException(status_code=502, detail="Failed to gunzip MRMS payload") from exc
-    else:
-        raw_bytes = payload
+        finally:
+            if gz_tmp_path.exists():
+                gz_tmp_path.unlink()
 
-    tmp_path = grib_path.with_suffix(".tmp")
-    tmp_path.write_bytes(raw_bytes)
-    tmp_path.replace(grib_path)
-
+    raw_tmp_path.replace(grib_path)
     return grib_path
 
 
 def extract_mesh_mm_at_point(grib_path: Path, lat: float, lon: float) -> float:
     """
     Memory-safe extraction:
-    Instead of loading the full CONUS grid with grb.values + grb.latlons(),
-    read only a small bounding box around the requested point.
+    read only a small bounding box around the requested point instead of
+    loading the full CONUS grid into memory.
     """
     norm_lon = normalize_lon_scalar(lon)
     lon_360 = to_360_lon(norm_lon)
@@ -342,7 +366,6 @@ def extract_mesh_mm_at_point(grib_path: Path, lat: float, lon: float) -> float:
     try:
         grb = grbs.message(1)
 
-        # Try progressively larger local boxes around the target point.
         for pad in (0.25, 0.50, 1.0, 2.0):
             lat1 = max(-90.0, lat - pad)
             lat2 = min(90.0, lat + pad)
