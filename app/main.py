@@ -18,7 +18,7 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
 APP_NAME = "mrms-mesh-service"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.3.0"
 
 AWS_BUCKET_BASE = os.getenv("MRMS_AWS_BASE", "https://noaa-mrms-pds.s3.amazonaws.com")
 CACHE_DIR = Path(os.getenv("CACHE_DIR", "/tmp/mrms-cache"))
@@ -27,20 +27,9 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 HTTP_TIMEOUT_SECONDS = float(os.getenv("HTTP_TIMEOUT_SECONDS", "45"))
 DOWNLOAD_TIMEOUT_SECONDS = float(os.getenv("DOWNLOAD_TIMEOUT_SECONDS", "120"))
 
-# Support the documented current naming, plus a fallback without underscores
 FILENAME_PATTERNS = [
-    re.compile(
-        r"MRMS_MESH_Max_1440min_00\.50_(?P<ymd>\d{8})-(?P<hms>\d{6})\.grib2\.gz$"
-    ),
-    re.compile(
-        r"MRMS_MESHMax1440min_00\.50_(?P<ymd>\d{8})-(?P<hms>\d{6})\.grib2\.gz$"
-    ),
-]
-
-# Prefix candidates to search in AWS
-PREFIX_PATTERNS = [
-    "CONUS/MESH_Max_1440min/{ymd}/",
-    "CONUS/MESHMax1440min/{ymd}/",
+    re.compile(r"MRMS_MESH_Max_1440min_00\.50_(?P<ymd>\d{8})-(?P<hms>\d{6})\.grib2\.gz$"),
+    re.compile(r"MRMS_MESHMax1440min_00\.50_(?P<ymd>\d{8})-(?P<hms>\d{6})\.grib2\.gz$"),
 ]
 
 MM_PER_INCH = 25.4
@@ -175,11 +164,19 @@ def matches_mesh_filename(filename: str, ymd: str) -> bool:
 
 async def resolve_daily_mesh_file(client: httpx.AsyncClient, requested_date: date_cls) -> ResolvedFile:
     ymd = requested_date.strftime("%Y%m%d")
+    mesh_prefixes = await discover_mesh_product_prefixes(client)
+
+    if not mesh_prefixes:
+        raise HTTPException(
+            status_code=500,
+            detail="No MESH-related CONUS prefixes found in AWS MRMS bucket.",
+        )
+
     candidates: list[ResolvedFile] = []
 
-    for prefix_template in PREFIX_PATTERNS:
-        prefix = prefix_template.format(ymd=ymd)
-        keys = await list_s3_keys(client, prefix)
+    for product_prefix in mesh_prefixes:
+        day_prefix = f"{product_prefix}{ymd}/"
+        keys = await list_s3_keys(client, day_prefix)
 
         for key in keys:
             filename = key.rsplit("/", 1)[-1]
@@ -193,14 +190,63 @@ async def resolve_daily_mesh_file(client: httpx.AsyncClient, requested_date: dat
                     )
                 )
 
+    deduped = {item.key: item for item in candidates}
+    candidates = list(deduped.values())
+
     if not candidates:
         raise HTTPException(
             status_code=404,
-            detail=f"No MRMS MESH 1440-minute files found in AWS archive for {requested_date.isoformat()}",
+            detail=(
+                f"No MRMS MESH 1440-minute files found in AWS archive for {requested_date.isoformat()}. "
+                f"Tried prefixes: {mesh_prefixes}"
+            ),
         )
 
     candidates.sort(key=lambda item: item.timestamp)
     return candidates[-1]
+
+
+async def discover_mesh_product_prefixes(client: httpx.AsyncClient) -> list[str]:
+    prefixes = await list_s3_common_prefixes(client, "CONUS/")
+    mesh_prefixes = [
+        prefix for prefix in prefixes
+        if "MESH" in prefix.upper()
+    ]
+    return sorted(mesh_prefixes)
+
+
+async def list_s3_common_prefixes(client: httpx.AsyncClient, prefix: str) -> list[str]:
+    prefixes: list[str] = []
+    continuation_token: str | None = None
+
+    while True:
+        params = {
+            "list-type": "2",
+            "prefix": prefix,
+            "delimiter": "/",
+            "max-keys": "1000",
+        }
+        if continuation_token:
+            params["continuation-token"] = continuation_token
+
+        response = await client.get(AWS_BUCKET_BASE + "/", params=params)
+        response.raise_for_status()
+
+        root = ET.fromstring(response.text)
+
+        for elem in root.findall(".//{*}CommonPrefixes/{*}Prefix"):
+            if elem.text:
+                prefixes.append(elem.text)
+
+        is_truncated = root.findtext(".//{*}IsTruncated", default="false").lower() == "true"
+        if not is_truncated:
+            break
+
+        continuation_token = root.findtext(".//{*}NextContinuationToken")
+        if not continuation_token:
+            break
+
+    return list(dict.fromkeys(prefixes))
 
 
 async def list_s3_keys(client: httpx.AsyncClient, prefix: str) -> list[str]:
@@ -278,7 +324,6 @@ def extract_mesh_mm_at_point(grib_path: Path, lat: float, lon: float) -> float:
 
         lat_scale = np.cos(np.deg2rad(lat))
         dist2 = (lats - lat) ** 2 + ((lons - norm_lon) * lat_scale) ** 2
-
         flat_order = np.argsort(dist2, axis=None)
 
         for flat_idx in flat_order[:500]:
