@@ -1,17 +1,25 @@
 # MRMS MESH Service
 
-Small Python FastAPI microservice for returning NOAA MRMS MESH hail estimates.
+FastAPI microservice for NOAA MRMS MESH hail-size lookup.
 
-## Endpoint
+## Main endpoint
 
-`GET /mesh?lat=33.80&lon=-84.31&date=2025-06-26`
+```text
+GET /mesh?lat=34.960468&lon=-81.880455&date=2025-08-20&radiusMiles=5&boundaryHours=3
+```
 
-Example response:
+The endpoint returns:
+- selected maximum MESH within the radius and expanded search window
+- daily `MESH_Max_1440min` result
+- hourly boundary `MESH_Max_60min` results only when hail is detected
+- hidden no-hail/no-data hourly counts to keep response concise
 
-```json
-{
-  "meshIn": 1.42,
-  "source": "NOAA MRMS MESH",
-  "timestamp": "2025-06-26T23:30:00Z",
-  "note": "Maximum Estimated Size of Hail 1440-minute swath at nearest MRMS grid point"
-}
+## Health check
+
+```text
+GET /healthz
+```
+
+## Render deployment
+
+Use Docker Web Service. Health check path: `/healthz`. Recommended instance: 2 GB RAM or higher.

@@ -1,0 +1,6 @@
+.git
+__pycache__
+*.pyc
+mrms-cache
+.env
+.venv

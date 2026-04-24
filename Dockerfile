@@ -3,7 +3,8 @@ FROM python:3.11-slim-bookworm
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    PORT=10000
+    PORT=10000 \
+    CACHE_DIR=/tmp/mrms-cache
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
